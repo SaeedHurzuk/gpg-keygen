@@ -1,0 +1,620 @@
+#!/usr/bin/env bash
+# ╔════════════════════════════════════════════════════════════════════════════════════════╗
+# ║                                                                                        ║
+# ║    ██████╗ ██████╗  ██████╗       ██╗  ██╗███████╗██╗   ██╗ ██████╗ ███████╗███╗   ██╗ ║
+# ║   ██╔════╝ ██╔══██╗██╔════╝       ██║ ██╔╝██╔════╝╚██╗ ██╔╝██╔════╝ ██╔════╝████╗  ██║ ║
+# ║   ██║  ███╗██████╔╝██║  ███╗      █████╔╝ █████╗   ╚████╔╝ ██║  ███╗█████╗  ██╔██╗ ██║ ║
+# ║   ██║   ██║██╔═══╝ ██║   ██║      ██╔═██╗ ██╔══╝    ╚██╔╝  ██║   ██║██╔══╝  ██║╚██╗██║ ║
+# ║   ╚██████╔╝██║     ╚██████╔╝      ██║  ██╗███████╗   ██║   ╚██████╔╝███████╗██║ ╚████║ ║
+# ║    ╚═════╝ ╚═╝      ╚═════╝       ╚═╝  ╚═╝╚══════╝   ╚═╝    ╚═════╝ ╚══════╝╚═╝  ╚═══╝ ║
+# ║                                                                                        ║
+# ║                gpg-keygen — Batch GPG key generation utility                           ║
+# ║                Compatible with macOS (GPG Suite / Homebrew) · Linux · BSD              ║
+# ║                Requires: bash 3.2+  ·  gpg / gpg2 1.4+                                 ║
+# ║                                                                                        ║
+# ╚════════════════════════════════════════════════════════════════════════════════════════╝
+#
+# USAGE
+#   gpg-keygen --interactive
+#   gpg-keygen -n "Alice" -e "alice@example.com" --export-public --output-dir ~/keys
+#   gpg-keygen -n "Bob"   -e "bob@example.com"   -x 0 --homedir ./gpg --export-secret
+#
+# MODES
+#   --interactive   Guided wizard — prompts for every field, passphrase, and export
+#   (flags only)    Scriptable / CI mode — supply everything via arguments
+#
+# EXIT CODES
+#   0  Success
+#   1  Fatal error (missing binary, GPG failure, bad args)
+#   2  Usage error (unknown flag, missing required field)
+
+set -uo pipefail
+# ⚠  -e (errexit) is deliberately omitted: `read` returns exit code 1 on empty
+#    input (user presses Enter), which would abort the script under -e.
+#    Errors are handled explicitly via die() throughout.
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  DEFAULTS
+#  All values can be overridden via flags or the interactive wizard.
+# ══════════════════════════════════════════════════════════════════════════════
+KEY_TYPE="RSA"
+KEY_LENGTH="4096"
+SUBKEY_TYPE="RSA"
+SUBKEY_LENGTH=""        # mirrors KEY_LENGTH unless explicitly set
+NAME_REAL=""
+NAME_COMMENT=""
+NAME_EMAIL=""
+EXPIRE_DATE="1y"
+GPG_HOMEDIR=""          # empty → GPG default (~/.gnupg)
+NO_PROTECTION=false
+DRY_RUN=false
+VERBOSE=false
+EXPORT_PUB=false
+EXPORT_SEC=false
+ARMOR=true              # ASCII-armored (.asc); use --no-armor for binary (.gpg)
+QUIET=false
+INTERACTIVE=false
+OUTPUT_DIR=""
+SAVE_BATCH=false
+PASSPHRASE_LINE=""
+
+progname="$(basename "$0")"
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  HELPERS
+#  Colour codes are only emitted when connected to a real TTY so piped/logged
+#  output stays clean and free of escape sequences.
+# ══════════════════════════════════════════════════════════════════════════════
+if [[ -t 1 && -t 2 ]]; then
+  _GRN='\033[0;32m'; _RED='\033[0;31m'; _RST='\033[0m'
+else
+  _GRN=''; _RED=''; _RST=''
+fi
+
+err()   { printf "  ${_RED}✖${_RST}  %s\n" "$*" >&2; }
+die()   { err "$*"; exit 1; }
+info()  { $QUIET || printf '  ➜  %s\n' "$*"; }
+ok()    { $QUIET || printf "  ${_GRN}✔${_RST}  %s\n" "$*"; }
+debug() { $VERBOSE && printf '  ·  [debug] %s\n' "$*" >&2 || true; }
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  HELP
+# ══════════════════════════════════════════════════════════════════════════════
+show_help() {
+  cat <<EOF
+
+  gpg-keygen — Batch GPG key generation utility
+
+  USAGE
+    $progname [options]
+
+  IDENTITY
+    -n, --name NAME          Real name  (required)
+    -e, --email EMAIL        Email address  (required)
+    -c, --comment COMMENT    Optional comment embedded in the UID
+
+  KEY OPTIONS
+    -t, --type TYPE          Key type: RSA | DSA | ECDSA | EdDSA  (default: $KEY_TYPE)
+    -s, --subkey-type TYPE   Subkey type  (default: same as --type)
+    -l, --length BITS        Key size in bits  (default: $KEY_LENGTH)
+        --subkey-length BITS Subkey size  (default: same as --length)
+    -x, --expire DATE        Expiry — 0=never · Ny=years · Nm=months · Nd=days
+                             (default: $EXPIRE_DATE)
+        --homedir DIR        GPG home directory  (default: ~/.gnupg)
+        --no-protection      Skip passphrase — generate an unprotected key
+
+  EXPORT
+        --export-public      Export the public key after generation
+        --export-secret      Export the secret key  (implies --export-public)
+        --no-armor           Write binary .gpg instead of ASCII-armored .asc
+        --output-dir DIR     Destination directory  (created if missing)
+
+  MISC
+        --save-batch         Save the GPG batch file to --output-dir
+        --interactive        Guided wizard — prompts for all fields
+        --dry-run            Print the batch file and exit without generating
+    -v, --verbose            Show debug output
+    -q, --quiet              Suppress all informational output
+    -h, --help               Show this help
+
+  EXAMPLES
+    $progname --interactive
+    $progname -n "Alice" -e "alice@example.com" --no-protection --export-public
+    $progname -n "Bob"   -e "bob@example.com"   -x 2y --output-dir ~/keys --export-public
+    $progname -n "Bob"   -e "bob@example.com"   -x 0  --homedir /tmp/mygpg --export-public
+
+EOF
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ARGUMENT PARSING
+# ══════════════════════════════════════════════════════════════════════════════
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -l|--length)         KEY_LENGTH="$2";              shift 2 ;;
+    --subkey-length)     SUBKEY_LENGTH="$2";           shift 2 ;;
+    -t|--type)           KEY_TYPE="$2";                shift 2 ;;
+    -s|--subkey-type)    SUBKEY_TYPE="$2";             shift 2 ;;
+    -n|--name)           NAME_REAL="$2";               shift 2 ;;
+    -c|--comment)        NAME_COMMENT="$2";            shift 2 ;;
+    -e|--email)          NAME_EMAIL="$2";              shift 2 ;;
+    -x|--expire)         EXPIRE_DATE="$2";             shift 2 ;;
+    --homedir)           GPG_HOMEDIR="$2";             shift 2 ;;
+    --no-protection)     NO_PROTECTION=true;           shift   ;;
+    --export-public)     EXPORT_PUB=true;              shift   ;;
+    --export-secret)     EXPORT_SEC=true; EXPORT_PUB=true; shift ;;
+    --no-armor)          ARMOR=false;                  shift   ;;
+    --dry-run)           DRY_RUN=true;                 shift   ;;
+    --interactive)       INTERACTIVE=true;             shift   ;;
+    -v|--verbose)        VERBOSE=true;                 shift   ;;
+    -q|--quiet)          QUIET=true;                   shift   ;;
+    --output-dir)        OUTPUT_DIR="$2";              shift 2 ;;
+    --save-batch)        SAVE_BATCH=true;              shift   ;;
+    -h|--help)           show_help; exit 0 ;;
+    --)                  shift; break ;;
+    -*) err "Unknown option: $1"; show_help; exit 2 ;;
+    *)  break ;;
+  esac
+done
+
+# ── No arguments at all → show help with a quick-start hint ──────────────────
+if [[ $# -eq 0 && -z "$NAME_REAL" && -z "$NAME_EMAIL" && "$INTERACTIVE" == false ]]; then
+  show_help
+  printf '  Required for non-interactive usage:\n'
+  printf '    -n, --name NAME    Full name\n'
+  printf '    -e, --email EMAIL  Email address\n\n'
+  printf '  Tip: run with --interactive to be guided through all options.\n\n'
+  exit 0
+fi
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  LOCATE GPG BINARY
+#  Prefer gpg2 (GnuPG 2.x); fall back to gpg (covers GPG 1.x and some distros
+#  that ship only the unversioned binary).
+# ══════════════════════════════════════════════════════════════════════════════
+GPG=""
+for _candidate in gpg2 gpg; do
+  if command -v "$_candidate" >/dev/null 2>&1; then
+    GPG="$_candidate"; break
+  fi
+done
+[[ -z "$GPG" ]] && die "gpg / gpg2 not found. Install GnuPG and try again."
+
+# Parse major.minor — used later to gate version-specific flags.
+_gpg_ver="$("$GPG" --version 2>/dev/null | awk 'NR==1{print $3}')"
+_gpg_major="${_gpg_ver%%.*}"
+_gpg_minor="${_gpg_ver#*.}"; _gpg_minor="${_gpg_minor%%.*}"
+debug "Binary: $GPG  version: $_gpg_ver  (major=$_gpg_major minor=${_gpg_minor:-?})"
+
+# Placeholder — populated after GPG_HOMEDIR is finalised below.
+_homedir_args=()
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  INTERACTIVE WIZARD
+#  Each prompt respects any value already provided via flags, so the wizard
+#  works equally well as a standalone mode or as a fill-in-the-blanks overlay
+#  on top of partial flag input.
+# ══════════════════════════════════════════════════════════════════════════════
+if $INTERACTIVE; then
+  printf '\n  ┌─ Identity ──────────────────────────────────\n'
+  [[ -z "$NAME_REAL"  ]] && { printf '  │  Name-Real  : '; read -r NAME_REAL;  }
+  [[ -z "$NAME_EMAIL" ]] && { printf '  │  Name-Email : '; read -r NAME_EMAIL; }
+  if [[ -z "$NAME_COMMENT" ]]; then
+    printf '  │  Comment    : (optional, Enter to skip) '
+    read -r NAME_COMMENT
+  fi
+
+  printf '  ├─ Key settings ──────────────────────────────\n'
+
+  # ── Key type ────────────────────────────────────
+  printf '  │\n'
+  printf '  │  Key type:\n'
+  printf '  │    1) RSA    — universal compatibility, widely supported\n'
+  printf '  │    2) DSA    — legacy signing key, no encryption subkey\n'
+  printf '  │    3) ECDSA  — elliptic curve, compact & fast\n'
+  printf '  │    4) EdDSA  — modern Ed25519 curve, recommended\n'
+  printf '  │\n'
+  while true; do
+    printf '  │  Choice [1]: '
+    read -r _tmp; _tmp="${_tmp:-1}"
+    case "$_tmp" in
+      1|rsa|RSA)     KEY_TYPE="RSA";   SUBKEY_TYPE="RSA";   break ;;
+      2|dsa|DSA)     KEY_TYPE="DSA";   SUBKEY_TYPE="ELG-E"; break ;;
+      3|ecdsa|ECDSA) KEY_TYPE="ECDSA"; SUBKEY_TYPE="ECDH";  break ;;
+      4|eddsa|EdDSA) KEY_TYPE="EdDSA"; SUBKEY_TYPE="ECDH";  break ;;
+      *) printf '  │  ✖  Please enter 1–4.\n' ;;
+    esac
+  done
+  printf '  │\n'
+
+  # ── Key length (only relevant for RSA / DSA) ────
+  if [[ "$KEY_TYPE" == "RSA" || "$KEY_TYPE" == "DSA" ]]; then
+    printf '  │  Key length:\n'
+    if [[ "$KEY_TYPE" == "RSA" ]]; then
+      printf '  │    1) 2048 — minimum acceptable\n'
+      printf '  │    2) 3072 — NIST recommended\n'
+      printf '  │    3) 4096 — strong, slightly slower  (default)\n'
+      printf '  │    4) custom\n'
+      printf '  │\n'
+      while true; do
+        printf '  │  Choice [3]: '
+        read -r _tmp; _tmp="${_tmp:-3}"
+        case "$_tmp" in
+          1) KEY_LENGTH="2048"; break ;;
+          2) KEY_LENGTH="3072"; break ;;
+          3) KEY_LENGTH="4096"; break ;;
+          4)
+            while true; do
+              printf '  │  Enter bits (1024–8192): '
+              read -r _tmp
+              if [[ "$_tmp" =~ ^[0-9]+$ && "$_tmp" -ge 1024 && "$_tmp" -le 8192 ]]; then
+                KEY_LENGTH="$_tmp"; break
+              fi
+              printf '  │  ✖  Must be a number between 1024 and 8192.\n'
+            done
+            break ;;
+          *) printf '  │  ✖  Please enter 1–4.\n' ;;
+        esac
+      done
+    else
+      # DSA supports up to 3072
+      printf '  │    1) 1024 — legacy\n'
+      printf '  │    2) 2048 — standard\n'
+      printf '  │    3) 3072 — maximum for DSA  (default)\n'
+      printf '  │    4) custom\n'
+      printf '  │\n'
+      while true; do
+        printf '  │  Choice [3]: '
+        read -r _tmp; _tmp="${_tmp:-3}"
+        case "$_tmp" in
+          1) KEY_LENGTH="1024"; break ;;
+          2) KEY_LENGTH="2048"; break ;;
+          3) KEY_LENGTH="3072"; break ;;
+          4)
+            while true; do
+              printf '  │  Enter bits (1024–3072): '
+              read -r _tmp
+              if [[ "$_tmp" =~ ^[0-9]+$ && "$_tmp" -ge 1024 && "$_tmp" -le 3072 ]]; then
+                KEY_LENGTH="$_tmp"; break
+              fi
+              printf '  │  ✖  Must be a number between 1024 and 3072.\n'
+            done
+            break ;;
+          *) printf '  │  ✖  Please enter 1–4.\n' ;;
+        esac
+      done
+    fi
+    SUBKEY_LENGTH="$KEY_LENGTH"
+  else
+    # ECC key types use a fixed curve — length is not user-configurable.
+    KEY_LENGTH="0"; SUBKEY_LENGTH="0"
+    printf '  │  Key length: (curve-based — not configurable for %s)\n' "$KEY_TYPE"
+  fi
+  printf '  │\n'
+
+  printf '  │  Expire date (0=never, Ny/Nm/Nd) [%s]: ' "$EXPIRE_DATE"
+  read -r _tmp && [[ -n "$_tmp" ]] && EXPIRE_DATE="$_tmp"
+
+  printf '  │  GPG homedir [default: ~/.gnupg]: '
+  read -r _tmp && [[ -n "$_tmp" ]] && GPG_HOMEDIR="$_tmp"
+
+  printf '  ├─ Security ──────────────────────────────────\n'
+  while true; do
+    printf '  │  Passphrase protect key? (y/n) [y]: '
+    read -r yn; yn="${yn:-y}"
+    case "$yn" in
+      [Yy]*)
+        while true; do
+          printf '  │  Enter passphrase   : '; read -rs p1; printf '\n'
+          printf '  │  Confirm passphrase : '; read -rs p2; printf '\n'
+          if   [[ "$p1" != "$p2" ]]; then printf '  │  ✖  Passphrases do not match. Try again.\n'
+          elif [[ -z "$p1"       ]]; then printf '  │  ✖  Empty passphrase not allowed. Answer n to skip.\n'
+          else PASSPHRASE_LINE="Passphrase: $p1"; break
+          fi
+        done
+        break ;;
+      [Nn]*)
+        NO_PROTECTION=true
+        info "Key will be generated without a passphrase."
+        break ;;
+      *) printf '  │  Please answer y or n.\n' ;;
+    esac
+  done
+
+  printf '  ├─ Export ────────────────────────────────────\n'
+  while true; do
+    printf '  │  Export keys? (pub · both · no) [pub]: '
+    read -r _expopt; _expopt="${_expopt:-pub}"
+    case "$_expopt" in
+      pub|public)  EXPORT_PUB=true;                  break ;;
+      both|secret) EXPORT_PUB=true; EXPORT_SEC=true; break ;;
+      no|none|n)                                      break ;;
+      *) printf '  │  Please answer pub, both, or no.\n' ;;
+    esac
+  done
+
+  if $EXPORT_PUB || $EXPORT_SEC; then
+    printf '  │  Output directory [default: current dir]: '
+    read -r _tmp && [[ -n "$_tmp" ]] && OUTPUT_DIR="$_tmp"
+  fi
+  printf '  └─────────────────────────────────────────────\n\n'
+fi
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  VALIDATION
+# ══════════════════════════════════════════════════════════════════════════════
+[[ -z "$NAME_REAL"  ]] && die "Name-Real is required  (-n / --name)."
+[[ -z "$NAME_EMAIL" ]] && die "Name-Email is required (-e / --email)."
+# Length validation only applies to RSA/DSA; ECC types use a fixed curve (length=0).
+if [[ "$KEY_TYPE" != "ECDSA" && "$KEY_TYPE" != "EdDSA" && "$KEY_TYPE" != "ECDH" ]]; then
+  [[ "$KEY_LENGTH" =~ ^[0-9]+$ ]] || die "Key length must be a positive integer."
+fi
+[[ "$EXPIRE_DATE" =~ ^(0|[0-9]+[yYmMdD]?|[0-9]{4}-[0-9]{2}-[0-9]{2})$ ]] || \
+  die "Invalid expire date '$EXPIRE_DATE'. Use: 0 · Ny · Nm · Nd · YYYY-MM-DD."
+
+# Mirror key length to subkey if not overridden.
+[[ -z "$SUBKEY_LENGTH" ]] && SUBKEY_LENGTH="$KEY_LENGTH"
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  GPG HOME DIRECTORY
+#  Create and lock down permissions; GPG refuses homedirs that aren't 0700.
+# ══════════════════════════════════════════════════════════════════════════════
+if [[ -n "$GPG_HOMEDIR" ]]; then
+  GPG_HOMEDIR="${GPG_HOMEDIR/#\~/$HOME}"
+  mkdir -p -- "$GPG_HOMEDIR" || die "Cannot create GPG homedir: $GPG_HOMEDIR"
+  chmod 700 -- "$GPG_HOMEDIR" 2>/dev/null || true
+  debug "GPG homedir: $GPG_HOMEDIR"
+fi
+[[ -n "$GPG_HOMEDIR" ]] && _homedir_args=(--homedir "$GPG_HOMEDIR") || _homedir_args=()
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  OUTPUT DIRECTORY
+#  Created here so export failures surface before GPG runs, not after.
+# ══════════════════════════════════════════════════════════════════════════════
+if [[ -n "$OUTPUT_DIR" ]]; then
+  OUTPUT_DIR="${OUTPUT_DIR/#\~/$HOME}"
+  mkdir -p -- "$OUTPUT_DIR" || die "Cannot create output directory: $OUTPUT_DIR"
+  chmod 700 -- "$OUTPUT_DIR" 2>/dev/null || true
+fi
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  NON-INTERACTIVE PASSPHRASE PROMPT
+#  Running with flags but no passphrase decision yet?  Ask once if stdin/stdout
+#  are a real TTY.  If we're piped or scripted, default to %no-protection so
+#  GPG never stalls with "Sorry, we are in batchmode - can't get input".
+# ══════════════════════════════════════════════════════════════════════════════
+if ! $INTERACTIVE && ! $NO_PROTECTION && [[ -z "${PASSPHRASE_LINE:-}" ]]; then
+  if [[ -t 0 && -t 1 ]]; then
+    while true; do
+      printf '  Passphrase protect key? (y/n) [y]: '
+      read -r yn; yn="${yn:-y}"
+      case "$yn" in
+        [Yy]*)
+          while true; do
+            printf '  Enter passphrase   : '; read -rs p1; printf '\n'
+            printf '  Confirm passphrase : '; read -rs p2; printf '\n'
+            if   [[ "$p1" != "$p2" ]]; then err "Passphrases do not match. Try again."
+            elif [[ -z "$p1"       ]]; then err "Empty passphrase not allowed. Answer n to skip."
+            else PASSPHRASE_LINE="Passphrase: $p1"; break
+            fi
+          done
+          break ;;
+        [Nn]*) NO_PROTECTION=true; break ;;
+        *) printf '  Please answer y or n.\n' ;;
+      esac
+    done
+  else
+    # No TTY — silently skip passphrase to avoid hanging.
+    NO_PROTECTION=true
+    debug "No TTY detected; defaulting to %no-protection."
+  fi
+fi
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  TEMP FILE
+#  Holds the GPG batch parameters.  Secured to 0600 immediately; wiped on exit
+#  via trap regardless of how the script terminates.
+#
+#  mktemp compatibility:
+#    macOS  →  mktemp -t prefix          (no --tmpdir flag)
+#    GNU    →  mktemp -t prefix.XXXXXX   (both forms work)
+# ══════════════════════════════════════════════════════════════════════════════
+TMPFILE=""
+TMPFILE="$(mktemp -t gpg-keygen-params.XXXXXX 2>/dev/null)" \
+  || TMPFILE="/tmp/gpg-keygen-params.$$.${RANDOM}"
+[[ -f "$TMPFILE" ]] || { : > "$TMPFILE"; } || die "Cannot create temp file."
+chmod 600 -- "$TMPFILE" 2>/dev/null || true
+trap '[[ -n "${TMPFILE:-}" && -f "$TMPFILE" ]] && rm -f -- "$TMPFILE"' EXIT
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  BUILD BATCH FILE
+#  GPG's unattended key generation format.  %no-protection requires GPG 2.1+;
+#  on 1.x we omit it and let gpg-agent handle the (empty) passphrase.
+# ══════════════════════════════════════════════════════════════════════════════
+{
+  printf "Key-Type: %s\n"      "$KEY_TYPE"
+  # ECC key types (ECDSA, EdDSA) use a fixed curve — Key-Length is not valid.
+  _is_ecc=false
+  [[ "$KEY_TYPE" == "ECDSA" || "$KEY_TYPE" == "EdDSA" ]] && _is_ecc=true
+  $_is_ecc || printf "Key-Length: %s\n" "$KEY_LENGTH"
+  printf "Key-Usage: sign,cert\n"
+  printf "Subkey-Type: %s\n"   "$SUBKEY_TYPE"
+  printf "Subkey-Usage: encrypt\n"
+  # ECDH subkey also has no configurable length.
+  [[ "$SUBKEY_TYPE" != "ECDH" && "$SUBKEY_LENGTH" != "0" ]] && \
+    printf "Subkey-Length: %s\n" "$SUBKEY_LENGTH"
+  printf "Name-Real: %s\n"     "$NAME_REAL"
+  [[ -n "$NAME_COMMENT" ]] && printf "Name-Comment: %s\n" "$NAME_COMMENT"
+  printf "Name-Email: %s\n"    "$NAME_EMAIL"
+  printf "Expire-Date: %s\n"   "$EXPIRE_DATE"
+  if $NO_PROTECTION; then
+    [[ "$_gpg_major" -ge 2 ]] && printf "%%no-protection\n"
+  elif [[ -n "${PASSPHRASE_LINE:-}" ]]; then
+    printf "%s\n" "$PASSPHRASE_LINE"
+  fi
+  printf "%%commit\n"
+} > "$TMPFILE"
+debug "Batch file written → $TMPFILE"
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  DRY RUN
+# ══════════════════════════════════════════════════════════════════════════════
+if $DRY_RUN; then
+  printf '\n  ┌─ Dry run — batch file ──────────────────────\n'
+  sed 's/^Passphrase: .*/Passphrase: [REDACTED]/' "$TMPFILE" | \
+    while IFS= read -r line; do printf '  │  %s\n' "$line"; done
+  printf '  └─────────────────────────────────────────────\n\n'
+  exit 0
+fi
+
+# Save a redacted copy of the batch file if requested.
+if $SAVE_BATCH && [[ -n "$OUTPUT_DIR" ]]; then
+  BATCH_OUT="$OUTPUT_DIR/gpg-keygen-batch.txt"
+  sed 's/^Passphrase: .*/Passphrase: [REDACTED]/' "$TMPFILE" > "$BATCH_OUT"
+  chmod 600 -- "$BATCH_OUT" 2>/dev/null || true
+  ok "Batch file saved → $BATCH_OUT"
+fi
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  GPG AGENT CONFIG  (macOS / GPG Suite compatibility)
+#
+#  GPG Suite ships its own gpg-agent which intercepts --pinentry-mode loopback
+#  at the agent level and silently ignores it — unless allow-loopback-pinentry
+#  is present in gpg-agent.conf.  We write that line now, then reload the agent
+#  so it takes effect before the key generation call below.
+# ══════════════════════════════════════════════════════════════════════════════
+if [[ "$_gpg_major" -ge 2 && "${_gpg_minor:-0}" -ge 1 ]]; then
+  _effective_homedir="${GPG_HOMEDIR:-$HOME/.gnupg}"
+  _agent_conf="${_effective_homedir}/gpg-agent.conf"
+  mkdir -p -- "$_effective_homedir" 2>/dev/null || true
+  if [[ -f "$_agent_conf" ]]; then
+    grep -q "allow-loopback-pinentry" "$_agent_conf" 2>/dev/null \
+      || printf '\nallow-loopback-pinentry\n' >> "$_agent_conf"
+  else
+    printf 'allow-loopback-pinentry\n' > "$_agent_conf"
+    chmod 600 -- "$_agent_conf" 2>/dev/null || true
+  fi
+  debug "allow-loopback-pinentry ensured in $_agent_conf"
+  if [[ -n "$GPG_HOMEDIR" ]]; then
+    gpgconf --homedir "$GPG_HOMEDIR" --reload gpg-agent >/dev/null 2>&1 || true
+  else
+    gpgconf --reload gpg-agent >/dev/null 2>&1 || true
+  fi
+fi
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  KEY GENERATION
+#
+#  --pinentry-mode loopback  GPG 2.1+ only; routes passphrase through stdin
+#                            instead of spawning an external pinentry dialog.
+#  --no-tty                  Prevents GPG from trying to open /dev/tty for
+#                            interactive prompts in a batch context.
+#  --gen-key <file>          Standard batch invocation (GPG 2.x).
+#
+#  Three attempts in order:
+#    1. filename arg  — preferred on GPG 2.x
+#    2. stdin         — fallback for GPG 1.x or quirky 2.x builds
+#    3. --full-generate-key  — some newer GPG versions dropped --gen-key
+# ══════════════════════════════════════════════════════════════════════════════
+_gpg_args=(--batch --no-tty --gen-key)
+if [[ "$_gpg_major" -ge 2 && "${_gpg_minor:-0}" -ge 1 ]]; then
+  _gpg_args=(--batch --no-tty --pinentry-mode loopback --gen-key)
+fi
+
+info "Generating key for $NAME_REAL <$NAME_EMAIL> ..."
+
+_gen_ok=false
+for _attempt in filename stdin full-gen-key; do
+  case "$_attempt" in
+    filename)
+      debug "Attempt 1/3 → filename argument"
+      "$GPG" "${_homedir_args[@]}" "${_gpg_args[@]}" "$TMPFILE" 2>&1 \
+        | sed 's/^/  │  /'
+      [[ ${PIPESTATUS[0]} -eq 0 ]] && { _gen_ok=true; break; } ;;
+    stdin)
+      debug "Attempt 2/3 → stdin"
+      "$GPG" "${_homedir_args[@]}" "${_gpg_args[@]}" < "$TMPFILE" 2>&1 \
+        | sed 's/^/  │  /'
+      [[ ${PIPESTATUS[0]} -eq 0 ]] && { _gen_ok=true; break; } ;;
+    full-gen-key)
+      debug "Attempt 3/3 → --full-generate-key"
+      _fargs=("${_gpg_args[@]/--gen-key/--full-generate-key}")
+      "$GPG" "${_homedir_args[@]}" "${_fargs[@]}" "$TMPFILE" 2>&1 \
+        | sed 's/^/  │  /'
+      [[ ${PIPESTATUS[0]} -eq 0 ]] && { _gen_ok=true; break; } ;;
+  esac
+  err "Attempt '$_attempt' failed — trying next method..."
+done
+
+$_gen_ok || die "All generation methods failed. See errors above."
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  KEY INFO DISPLAY
+#  Angle-bracket search is more precise (exact UID match); falls back to plain
+#  email for older GPG versions that don't support it.
+# ══════════════════════════════════════════════════════════════════════════════
+printf '\n'
+info "Key info:"
+_list_output=""
+for _search in "<${NAME_EMAIL}>" "${NAME_EMAIL}"; do
+  _list_output="$("$GPG" "${_homedir_args[@]}" --with-colons --list-keys "$_search" 2>/dev/null)"
+  [[ -n "$_list_output" ]] && break || true
+done
+
+if [[ -n "$_list_output" ]]; then
+  printf '  ┌─ Key info ──────────────────────────────────\n'
+  printf '%s\n' "$_list_output" | awk -F: '
+    $1=="pub" { keyid=$5 }
+    $1=="fpr" { if (!shown) { printf "  │  %-14s %s\n", "Fingerprint :", $10; shown=1 } }
+    $1=="uid" { printf "  │  %-14s %s\n", "UID :", $10 }
+    END       { if (keyid!="") printf "  │  %-14s %s\n", "Key ID :", keyid }
+  '
+  printf '  └─────────────────────────────────────────────\n'
+else
+  err "Could not retrieve key info for <$NAME_EMAIL> (generation may still have succeeded)."
+fi
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  EXPORT — PUBLIC KEY
+#  Permissions: 0644  (public by design — safe to share)
+# ══════════════════════════════════════════════════════════════════════════════
+if $EXPORT_PUB; then
+  SAFE_EMAIL="$(printf '%s' "$NAME_EMAIL" | sed 's/[^A-Za-z0-9._@-]/_/g')"
+  $ARMOR && PUBFILE="pubkey-${SAFE_EMAIL}.asc" || PUBFILE="pubkey-${SAFE_EMAIL}.gpg"
+  PUBPATH="${OUTPUT_DIR:-.}/$PUBFILE"
+
+  _export_args=(--export "$NAME_EMAIL")
+  $ARMOR && _export_args=(--armor --export "$NAME_EMAIL")
+
+  if "$GPG" "${_homedir_args[@]}" "${_export_args[@]}" > "$PUBPATH" 2>&1; then
+    chmod 644 -- "$PUBPATH" 2>/dev/null || true
+    ok "Public key  → $PUBPATH"
+  else
+    err "Failed to export public key."
+  fi
+fi
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  EXPORT — SECRET KEY
+#  Permissions: 0600  (private — never share this file)
+# ══════════════════════════════════════════════════════════════════════════════
+if $EXPORT_SEC; then
+  SAFE_EMAIL="$(printf '%s' "$NAME_EMAIL" | sed 's/[^A-Za-z0-9._@-]/_/g')"
+  $ARMOR && SECFILE="seckey-${SAFE_EMAIL}.asc" || SECFILE="seckey-${SAFE_EMAIL}.gpg"
+  SECPATH="${OUTPUT_DIR:-.}/$SECFILE"
+
+  _sec_args=(--export-secret-keys "$NAME_EMAIL")
+  $ARMOR && _sec_args=(--armor --export-secret-keys "$NAME_EMAIL")
+
+  if "$GPG" "${_homedir_args[@]}" "${_sec_args[@]}" > "$SECPATH" 2>&1; then
+    chmod 600 -- "$SECPATH" 2>/dev/null || true
+    ok "Secret key  → $SECPATH"
+  else
+    err "Failed to export secret key."
+  fi
+fi
+
+printf '\n'
+ok "Done."
+printf '\n'
+exit 0
