@@ -1,0 +1,386 @@
+#!/bin/sh
+# Polyglot launcher: bash finds python, python runs everything.
+# This file is valid both as a shell script and (after the exec) as Python.
+#
+# Step 1 (shell): find Python 3.8+, then exec THIS FILE as a Python script.
+# Step 2 (python): handle venv setup + show installer UI if needed.
+""":"
+for _py in \
+    "$HOME/.pyenv/shims/python3" \
+    /opt/homebrew/bin/python3.14 \
+    /opt/homebrew/bin/python3.13 \
+    /opt/homebrew/bin/python3.12 \
+    /opt/homebrew/bin/python3.11 \
+    /opt/homebrew/bin/python3.10 \
+    /opt/homebrew/bin/python3 \
+    /usr/local/bin/python3.14 \
+    /usr/local/bin/python3.13 \
+    /usr/local/bin/python3.12 \
+    /usr/local/bin/python3.11 \
+    /usr/local/bin/python3.10 \
+    /usr/local/bin/python3 \
+    /usr/bin/python3
+do
+    if [ -x "$_py" ]; then
+        _ok=$("$_py" -c "import sys; print(sys.version_info>=(3,8))" 2>/dev/null)
+        if [ "$_ok" = "True" ]; then
+            exec "$_py" "$0" "$@"
+        fi
+    fi
+done
+osascript -e 'display alert "Python 3.8+ not found" message "Install via Homebrew:\n  brew install python\nOr from:\n  https://www.python.org/downloads/" as critical buttons {"OK"}'
+exit 1
+"""
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  PYTHON SECTION — runs after the shell execs this file as Python
+# ══════════════════════════════════════════════════════════════════════════════
+import sys, os, subprocess, threading, time, shutil, logging
+from pathlib import Path
+
+# ── Logging (always write to disk so silent failures are debuggable) ──────────
+LOG_DIR = Path.home() / "Library" / "Logs" / "GPG-Keygen"
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+logging.basicConfig(
+    filename=str(LOG_DIR / "launch.log"),
+    level=logging.DEBUG,
+    format="%(asctime)s %(levelname)s %(message)s",
+)
+log = logging.getLogger("launcher")
+log.info("Launcher started — Python %s at %s", sys.version, sys.executable)
+
+# ── Paths ─────────────────────────────────────────────────────────────────────
+THIS_FILE   = Path(__file__).resolve()
+RESOURCES   = THIS_FILE.parent.parent / "Resources"
+MAIN_APP    = RESOURCES / "gpg_keygen_app.py"
+VENV_DIR    = Path.home() / "Library" / "Application Support" / "GPG-Keygen" / "venv"
+PACKAGES    = ["customtkinter", "colorama"]
+
+def find_venv_python() -> Path | None:
+    """Return the actual python binary inside the venv regardless of version suffix."""
+    bin_dir = VENV_DIR / "bin"
+    if not bin_dir.exists():
+        return None
+    # Try generic names first, then versioned (e.g. python3.14)
+    for name in ["python3", "python", "python3.14", "python3.13",
+                 "python3.12", "python3.11", "python3.10", "python3.9",
+                 "python3.8"]:
+        p = bin_dir / name
+        if p.exists() and p.is_file():
+            return p
+    # Last resort: any file starting with "python"
+    import glob
+    matches = sorted(glob.glob(str(bin_dir / "python*")))
+    for m in matches:
+        p = Path(m)
+        if p.is_file() and not p.suffix:
+            return p
+    return None
+
+# These are resolved lazily after venv creation
+VENV_PYTHON = VENV_DIR / "bin" / "python3"   # placeholder; use find_venv_python()
+VENV_PIP    = VENV_DIR / "bin" / "pip"
+
+SYS_PYTHON  = sys.executable
+
+log.info("RESOURCES=%s  MAIN_APP=%s  VENV=%s", RESOURCES, MAIN_APP, VENV_DIR)
+
+# Add GPG to PATH
+os.environ["PATH"] = (
+    "/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:"
+    + os.environ.get("PATH", "")
+)
+
+# ── Fast path: venv ready → launch immediately ────────────────────────────────
+def venv_ready() -> bool:
+    vpy = find_venv_python()
+    if vpy is None:
+        log.info("venv python not found in %s/bin", VENV_DIR)
+        return False
+    log.info("Found venv python: %s", vpy)
+    for pkg in PACKAGES:
+        r = subprocess.run([str(vpy), "-c", f"import {pkg}"],
+                           capture_output=True)
+        if r.returncode != 0:
+            log.info("package %s not importable in venv", pkg)
+            return False
+    log.info("venv ready — fast path")
+    return True
+
+if venv_ready():
+    vpy = find_venv_python()
+    log.info("Exec main app via venv python: %s", vpy)
+    os.execv(str(vpy), [str(vpy), str(MAIN_APP)])
+    sys.exit(0)  # unreachable
+
+# ── Needs setup — check tkinter before showing any UI ────────────────────────
+try:
+    import tkinter as tk
+    log.info("tkinter OK")
+except ImportError:
+    log.error("tkinter not available in %s", SYS_PYTHON)
+    ver = f"{sys.version_info.major}.{sys.version_info.minor}"
+    subprocess.run([
+        "osascript", "-e",
+        f'display alert "Tkinter not found" message "Install with:\\n'
+        f'  brew install python-tk@{ver}\\n\\nThen reopen GPG Keygen." '
+        f'as critical buttons {{"OK"}}',
+    ])
+    sys.exit(1)
+
+# ── Palette & fonts ───────────────────────────────────────────────────────────
+BG       = "#0a0c0f"
+SURFACE2 = "#161b22"
+BORDER   = "#1e2530"
+GREEN    = "#00ff88"
+GREEN_DK = "#003d1f"
+RED      = "#ff4455"
+AMBER    = "#ffb700"
+TEXT     = "#e2e8f0"
+DIM      = "#64748b"
+MONO     = "Menlo"
+SANS     = "Helvetica Neue"
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  INSTALLER WINDOW
+# ══════════════════════════════════════════════════════════════════════════════
+class Installer(tk.Tk):
+
+    def __init__(self):
+        super().__init__()
+        self._bar_pos    = 0.0
+        self._bar_target = 0.0
+        self._bar_w      = 460
+        self._repair     = VENV_DIR.exists() and find_venv_python() is not None
+
+        self._build_window()
+        self._build_ui()
+        self.after(16,  self._tick)
+        self.after(400, lambda: threading.Thread(
+            target=self._worker, daemon=True).start())
+
+    # ── Window ────────────────────────────────────────────────────────────────
+
+    def _build_window(self):
+        W, H = 540, 360
+        self.title("GPG Keygen — Setup")
+        self.configure(bg=BG)
+        self.resizable(False, False)
+        self.update_idletasks()
+        sx = self.winfo_screenwidth()
+        sy = self.winfo_screenheight()
+        self.geometry(f"{W}x{H}+{(sx-W)//2}+{(sy-H)//2}")
+        self.lift()
+        self.focus_force()
+        self.protocol("WM_DELETE_WINDOW", lambda: None)
+
+    # ── UI ────────────────────────────────────────────────────────────────────
+
+    def _build_ui(self):
+        tk.Frame(self, bg=GREEN, height=2).pack(fill="x")
+
+        wrap = tk.Frame(self, bg=BORDER, padx=1, pady=1)
+        wrap.pack(fill="both", expand=True)
+        self._card = tk.Frame(wrap, bg=BG)
+        self._card.pack(fill="both", expand=True)
+
+        self._body = tk.Frame(self._card, bg=BG)
+        self._body.pack(fill="both", expand=True, padx=40, pady=28)
+
+        # Header
+        hr = tk.Frame(self._body, bg=BG)
+        hr.pack(fill="x")
+        tk.Label(hr, text="⬡", font=(MONO, 30), fg=GREEN, bg=BG).pack(side="left", padx=(0,14))
+        ht = tk.Frame(hr, bg=BG)
+        ht.pack(side="left")
+        tk.Label(ht, text="GPG KEYGEN", font=(MONO, 18, "bold"), fg=GREEN, bg=BG, anchor="w").pack(fill="x")
+        sub = "Repairing environment…" if self._repair else "Setting up for the first time…"
+        tk.Label(ht, text=sub, font=(SANS, 12), fg=DIM, bg=BG, anchor="w").pack(fill="x")
+
+        tk.Frame(self._body, bg=BORDER, height=1).pack(fill="x", pady=(18, 16))
+
+        # Status
+        self._sv = tk.StringVar(value="Starting…")
+        self._dv = tk.StringVar(value="")
+        tk.Label(self._body, textvariable=self._sv,
+                 font=(MONO, 12), fg=TEXT, bg=BG, anchor="w").pack(fill="x")
+        tk.Label(self._body, textvariable=self._dv,
+                 font=(MONO, 10), fg=DIM, bg=BG, anchor="w").pack(fill="x", pady=(3, 14))
+
+        # Bar
+        bar_bg = tk.Frame(self._body, bg=SURFACE2, height=8)
+        bar_bg.pack(fill="x")
+        bar_bg.pack_propagate(False)
+        self._cv = tk.Canvas(bar_bg, bg=SURFACE2, height=8, highlightthickness=0, bd=0)
+        self._cv.pack(fill="both", expand=True)
+        self._cv.bind("<Configure>", lambda e: setattr(self, "_bar_w", e.width))
+        self._br = self._cv.create_rectangle(0, 0, 0, 8, fill=GREEN, outline="")
+
+        # Steps
+        sf = tk.Frame(self._body, bg=BG)
+        sf.pack(fill="x", pady=(18, 0))
+        self._dots = {}
+        defs = [
+            ("venv",   "Verify Python environment" if self._repair else "Create isolated Python environment"),
+            ("pkgs",   f"Install {', '.join(PACKAGES)}"),
+            ("launch", "Launch GPG Keygen"),
+        ]
+        for key, label in defs:
+            row = tk.Frame(sf, bg=BG)
+            row.pack(fill="x", pady=2)
+            dot = tk.Label(row, text="○", font=(MONO, 11), fg=DIM, bg=BG, width=3, anchor="w")
+            dot.pack(side="left")
+            tk.Label(row, text=label, font=(SANS, 11), fg=DIM, bg=BG, anchor="w").pack(side="left")
+            self._dots[key] = dot
+
+        self._nv = tk.StringVar(value="This only happens once.")
+        tk.Label(self._body, textvariable=self._nv,
+                 font=(SANS, 10), fg=DIM, bg=BG, anchor="w").pack(side="bottom", fill="x")
+
+    # ── Bar ───────────────────────────────────────────────────────────────────
+
+    def _tick(self):
+        diff = self._bar_target - self._bar_pos
+        self._bar_pos += diff * 0.14 if abs(diff) > 0.001 else diff
+        px = max(0, int(self._bar_pos * self._bar_w))
+        self._cv.coords(self._br, 0, 0, px, 8)
+        self.after(16, self._tick)
+
+    def _prog(self, f): self._bar_target = max(0.0, min(1.0, f))
+
+    # ── Step helpers ──────────────────────────────────────────────────────────
+
+    def _active(self, k): self.after(0, lambda: self._dots[k].config(text="◌", fg=AMBER))
+    def _done(self, k):   self.after(0, lambda: self._dots[k].config(text="✔", fg=GREEN))
+    def _fail(self, k):   self.after(0, lambda: self._dots[k].config(text="✖", fg=RED))
+    def _st(self, m, d=""): self.after(0, lambda: (self._sv.set(m), self._dv.set(d)))
+
+    # ── Worker ────────────────────────────────────────────────────────────────
+
+    def _worker(self):
+        try:
+            # Step 1: venv
+            self._active("venv")
+            self.after(0, lambda: self._prog(0.05))
+
+            if self._repair:
+                self._st("Verifying environment…", str(VENV_DIR))
+                log.info("Repair mode — checking venv python")
+                r = subprocess.run([str(find_venv_python() or VENV_PYTHON), "-c", "import sys"],
+                                   capture_output=True)
+                if r.returncode != 0:
+                    log.warning("venv python broken — rebuilding")
+                    self._st("Rebuilding broken environment…")
+                    shutil.rmtree(str(VENV_DIR), ignore_errors=True)
+                    self._make_venv()
+            else:
+                self._st("Creating Python environment…", str(VENV_DIR))
+                self._make_venv()
+
+            self._done("venv")
+            self.after(0, lambda: self._prog(0.30))
+
+            # Upgrade pip
+            self._st("Upgrading pip…")
+            subprocess.run([str(find_venv_python() or VENV_PYTHON), "-m", "pip", "install",
+                            "--upgrade", "pip", "-q"], capture_output=True)
+            self.after(0, lambda: self._prog(0.40))
+
+            # Step 2: packages
+            self._active("pkgs")
+            n = len(PACKAGES)
+            for i, pkg in enumerate(PACKAGES):
+                has = subprocess.run(
+                    [str(find_venv_python() or VENV_PYTHON), "-c", f"import {pkg}"],
+                    capture_output=True).returncode == 0
+                self._st(f"{'Verifying' if has else 'Installing'} {pkg}…",
+                         f"Package {i+1} of {n}")
+                self.after(0, lambda p=0.40+0.50*(i/n): self._prog(p))
+                log.info("%s %s", "skip" if has else "install", pkg)
+                if not has:
+                    r = subprocess.run([str(VENV_PIP), "install", pkg, "-q"],
+                                       capture_output=True, text=True)
+                    if r.returncode != 0:
+                        raise RuntimeError(f"Failed to install {pkg}:\n{r.stderr.strip()}")
+                # verify
+                v = subprocess.run([str(find_venv_python() or VENV_PYTHON), "-c", f"import {pkg}"],
+                                   capture_output=True)
+                if v.returncode != 0:
+                    raise RuntimeError(f"{pkg} installed but cannot be imported.")
+                log.info("%s ok", pkg)
+
+            self._done("pkgs")
+            self.after(0, lambda: self._prog(0.95))
+
+            # Step 3: launch
+            self._active("launch")
+            self._st("Launching GPG Keygen…")
+            self.after(0, lambda: self._nv.set("All done — starting now."))
+            time.sleep(0.7)
+            self._done("launch")
+            self.after(0, lambda: self._prog(1.0))
+            time.sleep(0.35)
+            self.after(0, self._launch)
+
+        except Exception as exc:
+            log.exception("Setup failed")
+            self.after(0, lambda e=str(exc): self._show_error(e))
+
+    def _make_venv(self):
+        global VENV_PYTHON, VENV_PIP
+        VENV_DIR.parent.mkdir(parents=True, exist_ok=True)
+        log.info("Creating venv at %s using %s", VENV_DIR, SYS_PYTHON)
+        r = subprocess.run([SYS_PYTHON, "-m", "venv", str(VENV_DIR)],
+                           capture_output=True, text=True)
+        log.info("venv stdout: %s  stderr: %s  rc: %s",
+                 r.stdout.strip(), r.stderr.strip(), r.returncode)
+        if r.returncode != 0:
+            raise RuntimeError(f"venv creation failed:\n{r.stderr.strip()}")
+        # Resolve the actual python binary (may be python3.14, not python3)
+        vpy = find_venv_python()
+        if vpy is None:
+            import glob
+            found = glob.glob(str(VENV_DIR / "bin" / "python*"))
+            raise RuntimeError(f"venv created but no python binary found.\nFound: {found}")
+        VENV_PYTHON = vpy
+        VENV_PIP    = VENV_DIR / "bin" / "pip"
+        log.info("Resolved venv python: %s", VENV_PYTHON)
+
+    def _launch(self):
+        vpy = find_venv_python()
+        log.info("Exec main app: %s %s", vpy, MAIN_APP)
+        try:
+            self.destroy()
+        except Exception:
+            pass
+        os.execv(str(vpy), [str(vpy), str(MAIN_APP)])
+
+    def _show_error(self, msg: str):
+        self._cv.itemconfig(self._br, fill=RED)
+        self._prog(1.0)
+        self._st("Setup failed", "")
+        self._nv.set(f"Check log: {LOG_DIR / 'launch.log'}")
+
+        err = tk.Frame(self._body, bg=SURFACE2, padx=12, pady=10)
+        err.pack(fill="x", pady=(6, 0))
+        tk.Label(err, text=msg[:400], font=(MONO, 10), fg=RED,
+                 bg=SURFACE2, justify="left", wraplength=420, anchor="w").pack(fill="x")
+
+        tk.Button(self._body, text="✕  Delete environment & retry",
+                  font=(MONO, 11), fg=GREEN, bg=GREEN_DK,
+                  activebackground="#005533", activeforeground=GREEN,
+                  relief="flat", bd=0, padx=14, pady=8, cursor="hand2",
+                  command=self._retry).pack(pady=(10,0), anchor="w")
+
+    def _retry(self):
+        log.info("Retry — wiping venv")
+        shutil.rmtree(str(VENV_DIR), ignore_errors=True)
+        # Restart by exec-ing this same launcher script again
+        self.destroy()
+        os.execv(sys.executable, [sys.executable, __file__])
+
+
+# ── Run ───────────────────────────────────────────────────────────────────────
+log.info("Showing installer window")
+Installer().mainloop()
+log.info("Installer exited")
