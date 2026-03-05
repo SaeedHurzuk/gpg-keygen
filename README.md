@@ -77,7 +77,7 @@ sudo dnf install gnupg2
 
 ```sh
 # Clone the repo
-git clone https://github.com/saeedhurzuk/gpg-keygen.git
+git clone https://github.com/SaeedHurzuk/gpg-keygen.git
 cd gpg-keygen
 
 # Make executable
@@ -90,7 +90,7 @@ sudo mv gpg-keygen /usr/local/bin/gpg-keygen
 Or grab it directly:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/saeedhurzuk/gpg-keygen/main/gpg-keygen \
+curl -fsSL https://raw.githubusercontent.com/SaeedHurzuk/gpg-keygen/refs/heads/master/gpg-keygen \
   -o gpg-keygen && chmod +x gpg-keygen
 ```
 
