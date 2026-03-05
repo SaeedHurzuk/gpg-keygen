@@ -9,11 +9,12 @@
 
 <div align="center">
 
-**Portable batch GPG key generation for macOS and Linux**
+**Portable batch GPG key generation — available in Bash and Python**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg?style=flat-square)](LICENSE)
 [![Shell: Bash](https://img.shields.io/badge/Shell-Bash%203.2%2B-4EAA25?style=flat-square&logo=gnubash&logoColor=white)](https://www.gnu.org/software/bash/)
-[![Platform](https://img.shields.io/badge/Platform-macOS%20%7C%20Linux%20%7C%20BSD-lightgrey?style=flat-square)]()
+[![Python](https://img.shields.io/badge/Python-3.7%2B-3776AB?style=flat-square&logo=python&logoColor=white)](https://www.python.org)
+[![Platform](https://img.shields.io/badge/Platform-macOS%20%7C%20Linux%20%7C%20Windows%20%7C%20BSD-lightgrey?style=flat-square)]()
 [![GPG](https://img.shields.io/badge/GnuPG-1.4%2B%20%2F%202.x-0093DD?style=flat-square)]()
 
 </div>
@@ -22,9 +23,20 @@
 
 ## Overview
 
-`gpg-keygen` is a single-file Bash utility that takes the friction out of GPG key generation. It wraps GPG's batch mode into either a polished interactive wizard or a fully scriptable CLI — whichever fits your workflow.
+`gpg-keygen` takes the friction out of GPG key generation. It wraps GPG's batch mode into either a polished interactive wizard or a fully scriptable CLI — whichever fits your workflow.
 
-No dependencies beyond `bash` and `gpg`. Works out of the box on macOS (GPG Suite or Homebrew), every major Linux distribution, and BSD.
+It comes in **two flavours** with full feature parity:
+
+| | `gpg-keygen` | `gpg-keygen.py` |
+|---|---|---|
+| **Runtime** | Bash 3.2+ | Python 3.7+ |
+| **Platform** | macOS · Linux · BSD | macOS · Linux · Windows · BSD |
+| **Dependencies** | `gpg` / `gpg2` only | `gpg` / `gpg2` + `colorama` |
+| **Dependency check** | Manual | Automatic — offers to install |
+| **Windows support** | WSL / Git Bash only | Native |
+| **Zero install** | ✔ one file, `chmod +x` | ✔ one file, `pip install colorama` |
+
+Pick the Bash version if you're on macOS or Linux and want zero setup. Pick the Python version if you're on Windows or want automatic dependency management.
 
 ---
 
@@ -40,18 +52,30 @@ No dependencies beyond `bash` and `gpg`. Works out of the box on macOS (GPG Suit
 - **macOS GPG Suite compatibility** — automatically configures `allow-loopback-pinentry` so batch mode never hangs
 - **Dry-run mode** — inspect the generated batch file before committing
 - **Coloured output** — green `✔` on success, red `✖` on error; stripped automatically when piped
-- **Zero install** — one file, `chmod +x`, done
+- **Automatic dependency check** *(Python)* — detects missing packages, offers to install them, writes `INSTALL_DEPENDENCIES.txt` if declined
 
 ---
 
 ## Requirements
+
+### Bash version
 
 | Requirement | Version |
 |-------------|---------|
 | Bash | 3.2 or later |
 | GnuPG | 1.4+ or 2.x (`gpg` or `gpg2`) |
 
-**macOS** — install via [GPG Suite](https://gpgtools.org) or Homebrew:
+### Python version
+
+| Requirement | Version |
+|-------------|---------|
+| Python | 3.7 or later |
+| GnuPG | 1.4+ or 2.x (`gpg` or `gpg2`) |
+| colorama | any (auto-installed if missing) |
+
+### Installing GnuPG
+
+**macOS** — [GPG Suite](https://gpgtools.org) or Homebrew:
 ```sh
 brew install gnupg
 ```
@@ -71,6 +95,8 @@ sudo pacman -S gnupg
 sudo dnf install gnupg2
 ```
 
+**Windows** — [Gpg4win](https://www.gpg4win.org) (required for the Python version on Windows)
+
 ---
 
 ## Installation
@@ -79,27 +105,87 @@ sudo dnf install gnupg2
 # Clone the repo
 git clone https://github.com/SaeedHurzuk/gpg-keygen.git
 cd gpg-keygen
+```
 
-# Make executable
+**Bash:**
+```sh
 chmod +x gpg-keygen
 
-# Optional: move to somewhere on your PATH
+# Optional: install system-wide
 sudo mv gpg-keygen /usr/local/bin/gpg-keygen
 ```
 
-Or grab it directly:
+**Python:**
+```sh
+pip install colorama   # or let the script install it for you on first run
+
+# Optional: install system-wide
+sudo mv gpg-keygen.py /usr/local/bin/gpg-keygen.py
+```
+
+Or grab individual files directly:
 
 ```sh
+# Bash
 curl -fsSL https://raw.githubusercontent.com/SaeedHurzuk/gpg-keygen/refs/heads/master/gpg-keygen \
   -o gpg-keygen && chmod +x gpg-keygen
+
+# Python
+curl -fsSL https://raw.githubusercontent.com/SaeedHurzuk/gpg-keygen/refs/heads/master/gpg-keygen.py \
+  -o gpg-keygen.py
+```
+
+---
+
+## Dependency check (Python only)
+
+The Python script checks all dependencies automatically on startup before doing anything else.
+
+**Missing Python package — offered for automatic install:**
+```
+  ┌─ Dependency check ──────────────────────────
+  │
+  │  Missing Python packages:
+  │    ✖  colorama
+  │
+  └─────────────────────────────────────────────
+
+  ➜  Install 'colorama' via pip? (y/n) [y]: y
+  ➜  Installing colorama ...
+  ✔  colorama installed successfully.
+```
+
+**If you decline**, or if GnuPG is missing (which can't be auto-installed), the script exits cleanly and writes an `INSTALL_DEPENDENCIES.txt` file next to the script with the exact commands you need:
+
+```
+  ➜  Install instructions saved → INSTALL_DEPENDENCIES.txt
+  ✖  Cannot continue. Run the install commands above, then re-run.
+```
+
+**Missing GnuPG** shows platform-specific install instructions:
+```
+  ┌─ Install GnuPG ──────────────────────────────
+  │  macOS (Homebrew):   brew install gnupg
+  │  macOS (GPG Suite):  https://gpgtools.org
+  │  Ubuntu / Debian:    sudo apt install gnupg
+  │  Arch Linux:         sudo pacman -S gnupg
+  │  RHEL / Fedora:      sudo dnf install gnupg2
+  │  Windows:            https://www.gpg4win.org
+  └─────────────────────────────────────────────
 ```
 
 ---
 
 ## Usage
 
-```
+Both scripts share identical flags and behaviour. Just swap the command.
+
+```sh
+# Bash
 gpg-keygen [options]
+
+# Python
+python3 gpg-keygen.py [options]
 ```
 
 Running with no arguments prints help and a quick-start tip.
@@ -114,6 +200,8 @@ The guided mode walks you through every option with a structured, framed UI. Rec
 
 ```sh
 gpg-keygen --interactive
+# or
+python3 gpg-keygen.py --interactive
 ```
 
 ```
@@ -167,7 +255,7 @@ gpg-keygen --interactive
 
 ### CLI / scriptable mode
 
-Supply everything via flags. If a passphrase decision is missing, the script will ask once when connected to a terminal, or silently default to `--no-protection` when piped/scripted.
+Supply everything via flags. Passphrase will be asked once if connected to a terminal, or silently defaults to `--no-protection` when piped/scripted.
 
 ```sh
 gpg-keygen \
@@ -185,6 +273,8 @@ gpg-keygen \
 ---
 
 ## Options
+
+All flags are identical between both versions.
 
 ### Identity
 
@@ -243,6 +333,8 @@ gpg-keygen \
 
 ## Examples
 
+The examples below use the Bash script. For Python, replace `gpg-keygen` with `python3 gpg-keygen.py` — all flags are identical.
+
 **Quick key, no passphrase, export public key only:**
 ```sh
 gpg-keygen -n "Bob" -e "bob@example.com" --no-protection --export-public
@@ -292,6 +384,11 @@ gpg-keygen \
 gpg-keygen -n "Alice" -e "alice@example.com" --type EdDSA --expire 1y --export-public
 ```
 
+**Windows (Python only):**
+```sh
+python3 gpg-keygen.py -n "Alice" -e "alice@example.com" --interactive
+```
+
 ---
 
 ## Exported file naming
@@ -308,6 +405,8 @@ Exported files are created with strict permissions:
 - Public key → `644` (safe to share)
 - Secret key → `600` (private — never share this file)
 
+> On Windows, `chmod` has no effect on NTFS. Secure your keys using filesystem ACLs or store them in a secrets manager.
+
 ---
 
 ## Exit codes
@@ -322,16 +421,34 @@ Exported files are created with strict permissions:
 
 ## macOS notes
 
-GPG Suite ships its own `gpg-agent` which overrides `--pinentry-mode loopback` at the agent level. `gpg-keygen` automatically writes `allow-loopback-pinentry` to `gpg-agent.conf` in the target homedir and reloads the agent before generating, so batch passphrase injection works reliably without any manual configuration.
+GPG Suite ships its own `gpg-agent` which overrides `--pinentry-mode loopback` at the agent level. Both scripts automatically write `allow-loopback-pinentry` to `gpg-agent.conf` in the target homedir and reload the agent before generating, so batch passphrase injection works reliably without any manual configuration.
+
+---
+
+## Windows notes (Python only)
+
+The Python version runs natively on Windows once [Gpg4win](https://www.gpg4win.org) is installed. The script automatically checks both standard Gpg4win install paths in addition to `PATH` when locating the GPG binary.
+
+`chmod` calls for key permissions are silently skipped on Windows since NTFS does not support Unix-style file permissions. Protect exported secret keys using Windows file ACLs or store them in a dedicated secrets manager.
 
 ---
 
 ## Security notes
 
-- The GPG batch file (containing the passphrase if one was set) is written to a `chmod 600` temp file and deleted on exit via `trap`, regardless of how the script terminates.
+- The GPG batch file (containing the passphrase if one was set) is written to a `chmod 600` temp file and deleted on exit via `trap` (Bash) or `atexit` (Python), regardless of how the script terminates.
 - The `--save-batch` flag saves a **redacted** copy only — the passphrase line is replaced with `[REDACTED]`.
 - Secret key exports are written `chmod 600`. Treat them like passwords — never commit them to version control.
 - `--no-protection` generates a key with no passphrase. Appropriate for automated/CI contexts where the key is stored in a secrets manager; not recommended for personal keys.
+
+---
+
+## Files in this repo
+
+| File | Description |
+|------|-------------|
+| `gpg-keygen` | Bash version — macOS, Linux, BSD |
+| `gpg-keygen.py` | Python version — macOS, Linux, Windows, BSD |
+| `LICENSE` | MIT license |
 
 ---
 
